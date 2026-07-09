@@ -1,0 +1,49 @@
+name: Voice Clone Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      sample_file:
+        description: 'Path to voice sample in voice_samples/'
+        required: true
+        default: 'voice_samples/Bee.m4a'
+      test_text:
+        description: 'Text to synthesize in the cloned voice'
+        required: true
+        default: 'Hi, this is a test of my cloned voice for the Mikasan narrator project.'
+
+jobs:
+  clone-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Install XTTS-v2 (Coqui TTS)
+        run: pip install TTS
+
+      - name: Convert sample to wav
+        run: |
+          mkdir -p output
+          ffmpeg -y -i "${{ github.event.inputs.sample_file }}" -ar 22050 -ac 1 output/reference.wav
+
+      - name: Run voice clone inference
+        run: |
+          tts --text "${{ github.event.inputs.test_text }}" \
+              --model_name tts_models/multilingual/multi-dataset/xtts_v2 \
+              --speaker_wav output/reference.wav \
+              --language_idx en \
+              --out_path output/cloned_test.wav
+
+      - name: Upload result
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloned-voice-test
+          path: output/cloned_test.wav
