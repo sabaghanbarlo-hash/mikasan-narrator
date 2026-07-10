@@ -29,9 +29,11 @@ jobs:
       - name: Install XTTS-v2 (Coqui TTS)
         run: |
           pip install TTS
-          # Coqui TTS's XTTS module needs an older transformers API
-          # (newer transformers removed BeamSearchScorer, which TTS still imports)
-          pip install "transformers==4.39.3" "tokenizers==0.15.2"
+          # Coqui TTS's XTTS module needs older/compatible deps than latest PyPI defaults:
+          # - transformers: newer versions removed BeamSearchScorer, which TTS still imports
+          # - torch: 2.6+ changed torch.load default to weights_only=True, which breaks
+          #   loading the XTTS checkpoint (an older-style pickle with custom classes)
+          pip install "transformers==4.39.3" "tokenizers==0.15.2" "torch==2.5.1" "torchaudio==2.5.1"
 
       - name: Convert sample to wav
         run: |
