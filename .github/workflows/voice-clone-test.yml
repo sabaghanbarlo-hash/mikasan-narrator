@@ -35,6 +35,8 @@ jobs:
           ffmpeg -y -i "${{ github.event.inputs.sample_file }}" -ar 22050 -ac 1 output/reference.wav
 
       - name: Run voice clone inference
+        env:
+          COQUI_TOS_AGREED: "1"
         run: |
           tts --text "${{ github.event.inputs.test_text }}" \
               --model_name tts_models/multilingual/multi-dataset/xtts_v2 \
