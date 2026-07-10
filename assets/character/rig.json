@@ -1,0 +1,8 @@
+{
+  "canvas_size": [900, 1200],
+  "left_eye_pos": [0, 0],
+  "right_eye_pos": [0, 0],
+  "mouth_pos": [0, 0],
+  "right_arm_idle_pos": [0, 0],
+  "right_arm_raised_pos": [0, 0]
+}
