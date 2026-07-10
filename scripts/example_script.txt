@@ -1,0 +1,12 @@
+VOICE_SAMPLE: voice_samples/Bee.m4a
+MUSIC:
+
+---
+IMAGE: cozy sunlit bedroom, anime background art, soft morning light through curtains
+Hey, it's me again. Today we're talking about something that's been on my mind for a while.
+---
+IMAGE: a winding forest path at dawn, misty, anime background art
+Sometimes the hardest part isn't the big decision. It's just starting.
+---
+IMAGE: a small desk with a lamp on, night scene, cozy anime background art
+So here's what I want you to try today.
