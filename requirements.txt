@@ -1,0 +1,9 @@
+requests
+Pillow
+TTS
+# Coqui TTS's XTTS module needs older/compatible deps than latest PyPI defaults
+# (see voice-clone-test.yml commit history for why these are pinned)
+transformers==4.39.3
+tokenizers==0.15.2
+torch==2.5.1
+torchaudio==2.5.1
