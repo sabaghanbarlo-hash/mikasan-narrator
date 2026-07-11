@@ -1,0 +1,53 @@
+name: Generate Cartoon
+
+on:
+  workflow_dispatch:
+    inputs:
+      script_path:
+        description: 'Path to the script file'
+        required: true
+        default: 'scripts/example_script.txt'
+      output_name:
+        description: 'Output filename (in output/)'
+        required: true
+        default: 'final_video.mp4'
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Install Rhubarb Lip Sync
+        run: |
+          curl -L -o rhubarb.zip https://github.com/DanielSWolf/rhubarb-lip-sync/releases/download/v1.13.0/Rhubarb-Lip-Sync-1.13.0-Linux.zip
+          unzip -q rhubarb.zip -d rhubarb_extracted
+          sudo mv rhubarb_extracted/Rhubarb-Lip-Sync-1.13.0-Linux/rhubarb /usr/local/bin/rhubarb
+          sudo chmod +x /usr/local/bin/rhubarb
+          rhubarb --version || echo "Rhubarb install check failed, pipeline will fall back to approximate lip-sync"
+
+      - name: Install Python dependencies
+        env:
+          COQUI_TOS_AGREED: "1"
+        run: pip install -r requirements.txt
+
+      - name: Generate video
+        env:
+          COQUI_TOS_AGREED: "1"
+        run: |
+          mkdir -p output
+          python generate_video.py --script "${{ github.event.inputs.script_path }}" --out "output/${{ github.event.inputs.output_name }}"
+
+      - name: Upload video
+        uses: actions/upload-artifact@v4
+        with:
+          name: mikasan-cartoon
+          path: output/*.mp4
