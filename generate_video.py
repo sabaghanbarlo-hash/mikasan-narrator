@@ -2,12 +2,22 @@
 """
 Mikasan Narrator - long-form cartoon generator
 -----------------------------------------------
-Turns a plain-text script into a video narrated in Saba's own cloned voice:
-word-accurate lip-sync (Rhubarb Lip Sync), blinking, idle bob, gesture animation,
-and AI-generated anime-style scene backgrounds -- all free, no API keys.
+Turns a plain-text script into a video narrated in Saba's own cloned voice, with an
+AI-generated Mikasan chibi character whose pose/expression adapts per scene based on
+context, plus lip-sync and blinking -- all free, no API keys.
 
-Adapted from free-ai-video-generator, swapping edge-tts for a cloned voice
-(Coqui XTTS-v2) driven by a reference sample in voice_samples/.
+HOW THE CHARACTER WORKS (no hand-drawn art required):
+  1. Each scene's narration is scanned for simple emotion cues (happy/thinking/
+     surprised/neutral) to pick an expression prompt.
+  2. Pollinations.ai generates ONE character pose image for that scene, on a plain
+     background, in the fixed Mikasan style.
+  3. Background removal (rembg) isolates the character onto a transparent PNG.
+  4. Mouth/eye states for lip-sync and blinking are drawn directly onto THAT SAME
+     image (not separately generated), so they stay perfectly aligned -- this trades
+     precise hand-drawn mouth shapes for guaranteed consistency.
+  Note: arm/gesture animation is not supported in this AI-generated mode (no reliable
+  way to isolate and reposition a limb from a flat generated image). Idle bob motion
+  still applies since that just repositions the whole character.
 
 Usage:
     python generate_video.py --script scripts/example_script.txt --out output/final_video.mp4
@@ -18,6 +28,7 @@ import json
 import math
 import os
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -26,17 +37,40 @@ from pathlib import Path
 from urllib.parse import quote
 
 import requests
-from PIL import Image
+from PIL import Image, ImageDraw
 
 CANVAS_W, CANVAS_H = 1920, 1080
 FPS = 25
 POLLINATIONS_BASE = "https://image.pollinations.ai/prompt"
 ANIME_STYLE_SUFFIX = (", anime background art, cel shaded, Studio Ghibli inspired, hand-painted anime "
                       "illustration, vibrant anime color palette, no photorealism")
-CHARACTER_DIR = Path(__file__).parent / "assets" / "character"
 DEFAULT_VOICE_SAMPLE = "voice_samples/Bee.m4a"
 
-# Rhubarb mouth-shape letters -> our 3 puppet mouth states
+# Fixed identity so the character reads as "the same character" across scenes even
+# though each pose is a fresh generation. Keep this description consistent.
+CHARACTER_IDENTITY = (
+    "chibi anime girl character reference, Mikasa-inspired, short black bob hair, "
+    "red scarf, big expressive dark eyes, simple black long-sleeve top, full body, "
+    "standing, front facing, centered, plain flat pastel background, character sheet style, "
+    "clean line art, cel shaded"
+)
+
+EXPRESSION_RULES = [
+    # (keywords, expression prompt fragment)
+    (r"\b(happy|excited|great|love|joy|smile|amazing|wonderful|fun)\b", "bright happy smile, cheerful expression"),
+    (r"\b(think|wonder|maybe|consider|hmm|question|why|how|curious)\b", "thoughtful pensive expression, hand near chin"),
+    (r"\b(wow|shock|surprised|suddenly|what\?|can't believe|whoa)\b", "surprised expression, wide eyes, eyebrows raised"),
+    (r"\b(sad|hard|difficult|tired|hurt|lonely|cry|lost)\b", "soft melancholic expression, gentle downward gaze"),
+]
+DEFAULT_EXPRESSION = "calm gentle expression, soft smile"
+
+# Approximate proportions (fractions of the character's cropped bounding box) where
+# facial features tend to land for a front-facing chibi character sheet pose.
+# Tune these if generated poses consistently land features elsewhere.
+EYE_L_REGION = (0.34, 0.30, 0.46, 0.38)   # left, top, right, bottom (fractions)
+EYE_R_REGION = (0.54, 0.30, 0.66, 0.38)
+MOUTH_REGION = (0.42, 0.42, 0.58, 0.50)
+
 VISEME_MAP = {
     "A": "closed", "B": "closed", "G": "closed", "X": "closed",
     "C": "mid", "E": "mid", "F": "mid", "H": "mid",
@@ -87,11 +121,9 @@ def parse_script(path: str):
 
 
 class ClonedVoice:
-    """Loads XTTS-v2 once and synthesizes narration in the cloned voice for every scene."""
-
     def __init__(self, speaker_wav: Path, language: str = "en"):
         os.environ.setdefault("COQUI_TOS_AGREED", "1")
-        from TTS.api import TTS  # imported lazily so --help etc. doesn't need the heavy deps
+        from TTS.api import TTS
         print("  Loading XTTS-v2 (first run downloads ~1.9GB model)...")
         self.tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2")
         self.speaker_wav = str(speaker_wav)
@@ -99,19 +131,15 @@ class ClonedVoice:
 
     def synth(self, text: str, out_wav: Path):
         self.tts.tts_to_file(
-            text=text,
-            speaker_wav=self.speaker_wav,
-            language=self.language,
-            file_path=str(out_wav),
+            text=text, speaker_wav=self.speaker_wav, language=self.language, file_path=str(out_wav),
         )
 
 
-def fetch_image(prompt: str, out_path: Path, width=CANVAS_W, height=CANVAS_H, retries=4):
+def fetch_pollinations_image(prompt: str, out_path: Path, width, height, model="flux-anime", retries=4):
     seed = random.randint(1, 999_999)
-    styled_prompt = f"{prompt}{ANIME_STYLE_SUFFIX}"
-    url = (f"{POLLINATIONS_BASE}/{quote(styled_prompt)}?width={width}&height={height}"
-           f"&seed={seed}&nologo=true&model=flux-anime")
-    fallback_url = (f"{POLLINATIONS_BASE}/{quote(styled_prompt)}?width={width}&height={height}"
+    url = (f"{POLLINATIONS_BASE}/{quote(prompt)}?width={width}&height={height}"
+           f"&seed={seed}&nologo=true&model={model}")
+    fallback_url = (f"{POLLINATIONS_BASE}/{quote(prompt)}?width={width}&height={height}"
                      f"&seed={seed}&nologo=true")
     last_err = None
     for attempt in range(1, retries + 1):
@@ -130,6 +158,76 @@ def fetch_image(prompt: str, out_path: Path, width=CANVAS_W, height=CANVAS_H, re
     raise RuntimeError(f"Failed to fetch image for prompt {prompt!r}: {last_err}")
 
 
+def pick_expression(narration: str) -> str:
+    lowered = narration.lower()
+    for pattern, expression in EXPRESSION_RULES:
+        if re.search(pattern, lowered):
+            return expression
+    return DEFAULT_EXPRESSION
+
+
+def autocrop_to_content(img: Image.Image) -> Image.Image:
+    bbox = img.getbbox()
+    return img.crop(bbox) if bbox else img
+
+
+def generate_character_pose(scene: dict, workdir: Path, index: int) -> Image.Image:
+    """Generates one context-appropriate character pose and returns it as a
+    background-removed RGBA image, cropped to its content bounding box."""
+    from rembg import remove
+
+    expression = pick_expression(scene["narration"])
+    prompt = f"{CHARACTER_IDENTITY}, {expression}"
+    raw_path = workdir / f"char_{index:03}_raw.png"
+    fetch_pollinations_image(prompt, raw_path, 768, 1024, model="flux-anime")
+
+    raw_img = Image.open(raw_path).convert("RGBA")
+    cutout = remove(raw_img)
+    cutout = autocrop_to_content(cutout)
+    return cutout
+
+
+def draw_eye_state(img: Image.Image, region_frac, closed: bool):
+    w, h = img.size
+    l, t, r, b = region_frac
+    box = (int(l * w), int(t * h), int(r * w), int(b * h))
+    if closed:
+        draw = ImageDraw.Draw(img)
+        cy = (box[1] + box[3]) // 2
+        draw.line([(box[0], cy), (box[2], cy)], fill=(40, 30, 30, 255), width=max(2, int(h * 0.006)))
+
+
+def draw_mouth_state(img: Image.Image, region_frac, state: str):
+    w, h = img.size
+    l, t, r, b = region_frac
+    cx = int((l + r) / 2 * w)
+    cy = int((t + b) / 2 * h)
+    half_w = int((r - l) * w / 2)
+    full_half_h = int((b - t) * h / 2)
+    scale = {"closed": 0.15, "mid": 0.55, "wide": 1.0}[state]
+    half_h = max(1, int(full_half_h * scale))
+    draw = ImageDraw.Draw(img)
+    draw.ellipse(
+        [cx - half_w, cy - half_h, cx + half_w, cy + half_h],
+        fill=(90, 40, 45, 255),
+    )
+
+
+def build_character_states(base_pose: Image.Image):
+    """Builds the (eyes, mouth) frame variants from a single generated pose so they
+    stay pixel-aligned (arm/gesture states are not modeled in AI-generated mode)."""
+    frames = {}
+    for eyes_state in ("open", "closed"):
+        for mouth_state in ("closed", "mid", "wide"):
+            frame = base_pose.copy()
+            if eyes_state == "closed":
+                draw_eye_state(frame, EYE_L_REGION, True)
+                draw_eye_state(frame, EYE_R_REGION, True)
+            draw_mouth_state(frame, MOUTH_REGION, mouth_state)
+            frames[(eyes_state, mouth_state)] = frame
+    return frames
+
+
 def run(cmd, **kwargs):
     result = subprocess.run(cmd, capture_output=True, text=True, **kwargs)
     if result.returncode != 0:
@@ -145,18 +243,9 @@ def get_duration(path: Path) -> float:
     return float(result.stdout.strip())
 
 
-def wav_from_any(src_path: Path, wav_path: Path):
-    run(["ffmpeg", "-y", "-i", str(src_path), "-ar", "22050", "-ac", "1", str(wav_path), "-loglevel", "error"])
-
-
 def run_rhubarb(wav_path: Path, out_json: Path, rhubarb_bin="rhubarb"):
-    """Runs Rhubarb Lip Sync and returns a list of {start, end, value} mouth cues."""
     try:
-        run([
-            rhubarb_bin, "-f", "json", "-o", str(out_json),
-            "--recognizer", "phonetic",
-            str(wav_path),
-        ])
+        run([rhubarb_bin, "-f", "json", "-o", str(out_json), "--recognizer", "phonetic", str(wav_path)])
         data = json.loads(out_json.read_text(encoding="utf-8"))
         return data.get("mouthCues", [])
     except Exception as e:  # noqa: BLE001
@@ -165,7 +254,6 @@ def run_rhubarb(wav_path: Path, out_json: Path, rhubarb_bin="rhubarb"):
 
 
 def approximate_mouth_cues(wav_path: Path, duration: float):
-    """Fallback if Rhubarb isn't installed: derive rough mouth movement from audio volume."""
     import wave
     import audioop
 
@@ -204,49 +292,6 @@ def mouth_state_at(cues, t: float) -> str:
     return "closed"
 
 
-class CharacterRig:
-    def __init__(self, character_dir: Path):
-        cfg = json.loads((character_dir / "rig.json").read_text())
-        self.left_eye_pos = tuple(cfg["left_eye_pos"])
-        self.right_eye_pos = tuple(cfg["right_eye_pos"])
-        self.mouth_pos = tuple(cfg["mouth_pos"])
-        self.canvas_size = tuple(cfg["canvas_size"])
-        self.right_arm_idle_pos = tuple(cfg["right_arm_idle_pos"])
-        self.right_arm_raised_pos = tuple(cfg["right_arm_raised_pos"])
-
-        base = Image.open(character_dir / "base.png").convert("RGBA")
-        eye_l_open = Image.open(character_dir / "eye_l_open.png")
-        eye_r_open = Image.open(character_dir / "eye_r_open.png")
-        eye_closed = Image.open(character_dir / "eye_closed.png")
-        mouths = {
-            "closed": Image.open(character_dir / "mouth_closed.png"),
-            "mid": Image.open(character_dir / "mouth_mid.png"),
-            "wide": Image.open(character_dir / "mouth_wide.png"),
-        }
-        arms = {
-            "idle": (Image.open(character_dir / "arm_idle.png").convert("RGBA"), self.right_arm_idle_pos),
-            "raised": (Image.open(character_dir / "arm_raised.png").convert("RGBA"), self.right_arm_raised_pos),
-        }
-
-        self.frames = {}
-        for eyes_state in ("open", "closed"):
-            for mouth_state, mouth_img in mouths.items():
-                for arm_state, (arm_img, arm_pos) in arms.items():
-                    frame = base.copy()
-                    frame.paste(arm_img, arm_pos, arm_img)
-                    if eyes_state == "open":
-                        frame.paste(eye_l_open, self.left_eye_pos, eye_l_open)
-                        frame.paste(eye_r_open, self.right_eye_pos, eye_r_open)
-                    else:
-                        frame.paste(eye_closed, self.left_eye_pos, eye_closed)
-                        frame.paste(eye_closed, self.right_eye_pos, eye_closed)
-                    frame.paste(mouth_img, self.mouth_pos, mouth_img)
-                    self.frames[(eyes_state, mouth_state, arm_state)] = frame
-
-    def get(self, eyes_state: str, mouth_state: str, arm_state: str) -> Image.Image:
-        return self.frames[(eyes_state, mouth_state, arm_state)]
-
-
 def make_blink_schedule(duration: float, min_gap=2.5, max_gap=5.5, blink_len=0.14):
     schedule = []
     t = random.uniform(1.0, min_gap)
@@ -257,27 +302,7 @@ def make_blink_schedule(duration: float, min_gap=2.5, max_gap=5.5, blink_len=0.1
 
 
 def is_blinking(schedule, t: float) -> bool:
-    for start, end in schedule:
-        if start <= t < end:
-            return True
-    return False
-
-
-def make_gesture_schedule(duration: float, min_gap=3.5, max_gap=7.0, gesture_len=1.3):
-    """Periodically raises the character's arm for a natural talking-gesture feel."""
-    schedule = []
-    t = random.uniform(1.5, min_gap)
-    while t < duration - gesture_len * 0.5:
-        schedule.append((t, t + gesture_len))
-        t += random.uniform(min_gap, max_gap)
-    return schedule
-
-
-def arm_state_at(schedule, t: float) -> str:
-    for start, end in schedule:
-        if start <= t < end:
-            return "raised"
-    return "idle"
+    return any(start <= t < end for start, end in schedule)
 
 
 def prepare_background(image_path: Path, width, height) -> Image.Image:
@@ -296,45 +321,36 @@ def prepare_background(image_path: Path, width, height) -> Image.Image:
     return img.crop((left, top, left + width, top + height))
 
 
-def render_scene(background: Image.Image, rig: CharacterRig, mouth_cues, blink_schedule,
-                  gesture_schedule, duration: float, audio_path: Path, out_path: Path,
-                  char_scale=0.85, fps=FPS):
+def render_scene(background: Image.Image, char_frames: dict, mouth_cues, blink_schedule,
+                  duration: float, audio_path: Path, out_path: Path, char_scale=0.85, fps=FPS):
+    sample_img = next(iter(char_frames.values()))
     char_h = int(CANVAS_H * char_scale)
-    char_w = int(char_h * rig.canvas_size[0] / rig.canvas_size[1])
+    char_w = int(char_h * sample_img.width / sample_img.height)
     anchor_x = (CANVAS_W - char_w) // 2
     anchor_y = CANVAS_H - char_h + 20
 
-    resized_cache = {
-        key: img.resize((char_w, char_h), Image.LANCZOS)
-        for key, img in rig.frames.items()
-    }
-
+    resized_cache = {key: img.resize((char_w, char_h), Image.LANCZOS) for key, img in char_frames.items()}
     total_frames = max(int(duration * fps), fps)
 
     ffmpeg_cmd = [
         "ffmpeg", "-y",
         "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{CANVAS_W}x{CANVAS_H}", "-r", str(fps),
-        "-i", "-",
-        "-i", str(audio_path),
-        "-c:v", "libx264", "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-shortest",
+        "-i", "-", "-i", str(audio_path),
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest",
         str(out_path), "-loglevel", "error",
     ]
     proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE)
-
     bg_rgba = background.convert("RGBA")
 
     for i in range(total_frames):
         t = i / fps
         mouth_state = mouth_state_at(mouth_cues, t) if mouth_cues else "closed"
         eyes_state = "closed" if is_blinking(blink_schedule, t) else "open"
-        arm_state = arm_state_at(gesture_schedule, t)
-        char_img = resized_cache[(eyes_state, mouth_state, arm_state)]
+        char_img = resized_cache[(eyes_state, mouth_state)]
 
         bob = int(5 * math.sin(2 * math.pi * t / 2.6))
         frame = bg_rgba.copy()
         frame.alpha_composite(char_img, (anchor_x, anchor_y + bob))
-
         proc.stdin.write(frame.convert("RGB").tobytes())
 
     proc.stdin.close()
@@ -345,29 +361,22 @@ def render_scene(background: Image.Image, rig: CharacterRig, mouth_cues, blink_s
 
 def concat_clips(clip_paths, out_path: Path, workdir: Path):
     list_file = workdir / "concat_list.txt"
-    list_file.write_text(
-        "\n".join(f"file '{p.resolve()}'" for p in clip_paths), encoding="utf-8"
-    )
-    run([
-        "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-        "-i", str(list_file), "-c", "copy", str(out_path), "-loglevel", "error",
-    ])
+    list_file.write_text("\n".join(f"file '{p.resolve()}'" for p in clip_paths), encoding="utf-8")
+    run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(list_file), "-c", "copy",
+         str(out_path), "-loglevel", "error"])
 
 
 def add_background_music(video_path: Path, music_path: Path, out_path: Path, volume=0.12):
     run([
-        "ffmpeg", "-y",
-        "-i", str(video_path), "-stream_loop", "-1", "-i", str(music_path),
+        "ffmpeg", "-y", "-i", str(video_path), "-stream_loop", "-1", "-i", str(music_path),
         "-filter_complex",
         f"[1:a]volume={volume}[music];[0:a][music]amix=inputs=2:duration=first:dropout_transition=2[aout]",
-        "-map", "0:v", "-map", "[aout]",
-        "-c:v", "copy", "-shortest", str(out_path),
-        "-loglevel", "error",
+        "-map", "0:v", "-map", "[aout]", "-c:v", "copy", "-shortest", str(out_path), "-loglevel", "error",
     ])
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Generate a Mikasan-narrated cartoon from a script, in Saba's cloned voice.")
+    ap = argparse.ArgumentParser(description="Generate a Mikasan-narrated cartoon with an AI-generated, context-adaptive character.")
     ap.add_argument("--script", required=True)
     ap.add_argument("--out", default="output/final_video.mp4")
     ap.add_argument("--voice-sample", default=None)
@@ -390,14 +399,13 @@ def main():
     workdir.mkdir(parents=True)
 
     print(f"Loaded {len(scenes)} scene(s). Voice sample: {voice_sample}. Music: {music or 'none'}")
-    rig = CharacterRig(CHARACTER_DIR)
     voice = ClonedVoice(Path(voice_sample), language=args.language)
 
     clip_paths = []
     for i, scene in enumerate(scenes):
         print(f"\n[{i+1}/{len(scenes)}] {scene['narration'][:70]}...")
         audio_wav = workdir / f"scene_{i:03}.wav"
-        image_path = workdir / f"scene_{i:03}.jpg"
+        bg_image_path = workdir / f"scene_{i:03}_bg.jpg"
         rhubarb_json = workdir / f"scene_{i:03}_mouth.json"
         clip_path = workdir / f"scene_{i:03}.mp4"
 
@@ -410,15 +418,18 @@ def main():
         if mouth_cues is None:
             mouth_cues = approximate_mouth_cues(audio_wav, duration)
         blink_schedule = make_blink_schedule(duration)
-        gesture_schedule = make_gesture_schedule(duration)
+
+        print("  -> generating context-driven character pose")
+        base_pose = generate_character_pose(scene, workdir, i)
+        char_frames = build_character_states(base_pose)
 
         print(f"  -> generating background: {scene['image_prompt'][:70]}...")
-        fetch_image(scene["image_prompt"], image_path, CANVAS_W, CANVAS_H)
-        background = prepare_background(image_path, CANVAS_W, CANVAS_H)
+        fetch_pollinations_image(f"{scene['image_prompt']}{ANIME_STYLE_SUFFIX}", bg_image_path, CANVAS_W, CANVAS_H)
+        background = prepare_background(bg_image_path, CANVAS_W, CANVAS_H)
 
         print(f"  -> rendering animated scene ({duration:.1f}s, {int(duration*FPS)} frames)")
-        render_scene(background, rig, mouth_cues, blink_schedule, gesture_schedule, duration,
-                     audio_wav, clip_path, char_scale=args.character_scale)
+        render_scene(background, char_frames, mouth_cues, blink_schedule, duration, audio_wav,
+                     clip_path, char_scale=args.character_scale)
         clip_paths.append(clip_path)
 
     print("\nConcatenating all scenes...")
