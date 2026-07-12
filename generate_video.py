@@ -48,15 +48,17 @@ DEFAULT_VOICE_SAMPLE = "voice_samples/Bee.m4a"
 
 # Fixed identity so the character reads as "the same character" across scenes even
 # though each pose is a fresh generation. Keep this description consistent.
+# IMPORTANT: avoid words like "character sheet" / "reference sheet" / "turnaround" --
+# image models read those as a request for a multi-pose grid (front/side/back), which
+# produces several copies of the character in one image instead of a single pose.
 CHARACTER_IDENTITY = (
-    "chibi anime girl character reference, Mikasa-inspired, short black bob hair, "
-    "red scarf, big expressive dark eyes, simple black long-sleeve top, full body, "
-    "standing, front facing, centered, plain flat pastel background, character sheet style, "
-    "clean line art, cel shaded"
+    "a single solo chibi anime girl, one character only, one pose only, no other people, "
+    "Mikasa-inspired, short black bob hair, red scarf, big expressive dark eyes, "
+    "simple black long-sleeve top, full body, standing, front facing, centered in frame, "
+    "plain flat pastel background, clean line art, cel shaded, isolated single figure"
 )
 
 EXPRESSION_RULES = [
-    # (keywords, expression prompt fragment)
     (r"\b(happy|excited|great|love|joy|smile|amazing|wonderful|fun)\b", "bright happy smile, cheerful expression"),
     (r"\b(think|wonder|maybe|consider|hmm|question|why|how|curious)\b", "thoughtful pensive expression, hand near chin"),
     (r"\b(wow|shock|surprised|suddenly|what\?|can't believe|whoa)\b", "surprised expression, wide eyes, eyebrows raised"),
@@ -65,11 +67,17 @@ EXPRESSION_RULES = [
 DEFAULT_EXPRESSION = "calm gentle expression, soft smile"
 
 # Approximate proportions (fractions of the character's cropped bounding box) where
-# facial features tend to land for a front-facing chibi character sheet pose.
-# Tune these if generated poses consistently land features elsewhere.
-EYE_L_REGION = (0.34, 0.30, 0.46, 0.38)   # left, top, right, bottom (fractions)
+# facial features tend to land for a front-facing chibi character pose.
+EYE_L_REGION = (0.34, 0.30, 0.46, 0.38)
 EYE_R_REGION = (0.54, 0.30, 0.66, 0.38)
 MOUTH_REGION = (0.42, 0.42, 0.58, 0.50)
+
+# A single standing chibi figure should be noticeably taller than wide. If the
+# background-removed cutout is wider than this, it's almost certainly multiple
+# characters side by side (a multi-pose grid slipping past the prompt) -- reject
+# and regenerate rather than silently rendering a broken frame.
+MAX_ACCEPTABLE_ASPECT_RATIO = 0.85  # width / height
+MAX_POSE_GENERATION_ATTEMPTS = 4
 
 VISEME_MAP = {
     "A": "closed", "B": "closed", "G": "closed", "X": "closed",
@@ -135,8 +143,8 @@ class ClonedVoice:
         )
 
 
-def fetch_pollinations_image(prompt: str, out_path: Path, width, height, model="flux-anime", retries=4):
-    seed = random.randint(1, 999_999)
+def fetch_pollinations_image(prompt: str, out_path: Path, width, height, model="flux-anime", retries=4, seed=None):
+    seed = seed if seed is not None else random.randint(1, 999_999)
     url = (f"{POLLINATIONS_BASE}/{quote(prompt)}?width={width}&height={height}"
            f"&seed={seed}&nologo=true&model={model}")
     fallback_url = (f"{POLLINATIONS_BASE}/{quote(prompt)}?width={width}&height={height}"
@@ -173,18 +181,34 @@ def autocrop_to_content(img: Image.Image) -> Image.Image:
 
 def generate_character_pose(scene: dict, workdir: Path, index: int) -> Image.Image:
     """Generates one context-appropriate character pose and returns it as a
-    background-removed RGBA image, cropped to its content bounding box."""
+    background-removed RGBA image, cropped to its content bounding box.
+
+    Retries if the result looks like a multi-character grid (too wide relative to
+    height for a single standing chibi figure) rather than one pose.
+    """
     from rembg import remove
 
     expression = pick_expression(scene["narration"])
     prompt = f"{CHARACTER_IDENTITY}, {expression}"
-    raw_path = workdir / f"char_{index:03}_raw.png"
-    fetch_pollinations_image(prompt, raw_path, 768, 1024, model="flux-anime")
 
-    raw_img = Image.open(raw_path).convert("RGBA")
-    cutout = remove(raw_img)
-    cutout = autocrop_to_content(cutout)
-    return cutout
+    last_cutout = None
+    for attempt in range(1, MAX_POSE_GENERATION_ATTEMPTS + 1):
+        raw_path = workdir / f"char_{index:03}_raw_{attempt}.png"
+        fetch_pollinations_image(prompt, raw_path, 768, 1024, model="flux-anime")
+
+        raw_img = Image.open(raw_path).convert("RGBA")
+        cutout = remove(raw_img)
+        cutout = autocrop_to_content(cutout)
+        last_cutout = cutout
+
+        aspect_ratio = cutout.width / cutout.height
+        if aspect_ratio <= MAX_ACCEPTABLE_ASPECT_RATIO:
+            return cutout
+        print(f"  [character] attempt {attempt} looked like multiple characters "
+              f"(aspect ratio {aspect_ratio:.2f}), regenerating...")
+
+    print("  [character] all attempts looked wide; using the last one anyway.")
+    return last_cutout
 
 
 def draw_eye_state(img: Image.Image, region_frac, closed: bool):
@@ -214,8 +238,6 @@ def draw_mouth_state(img: Image.Image, region_frac, state: str):
 
 
 def build_character_states(base_pose: Image.Image):
-    """Builds the (eyes, mouth) frame variants from a single generated pose so they
-    stay pixel-aligned (arm/gesture states are not modeled in AI-generated mode)."""
     frames = {}
     for eyes_state in ("open", "closed"):
         for mouth_state in ("closed", "mid", "wide"):
