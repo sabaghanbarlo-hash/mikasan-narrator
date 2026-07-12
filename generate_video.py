@@ -2,24 +2,21 @@
 """
 Mikasan Narrator - long-form cartoon generator
 -----------------------------------------------
-Turns a plain-text script into a video narrated in Saba's own cloned voice, with an
-AI-generated Mikasan chibi character (positioned left/right, alternating per scene),
-video-game-style captions synced to the narration, and vivid cartoon backgrounds --
-all free, no API keys.
+Turns a plain-text script into a video narrated in Saba's own cloned voice, with the
+fixed Mikasan character (assets/character/character.png), a solid tan background, and
+karaoke-style animated captions synced to the narration -- all free, no API keys.
 
 HOW IT WORKS:
-  1. Each scene's narration is scanned for simple emotion cues (happy/thinking/
-     surprised/neutral) to pick an expression for the character pose.
-  2. Pollinations.ai generates ONE character pose for that scene (hand-drawn digital
-     illustration style), background removal (rembg) isolates it.
-  3. The character is placed on alternating left/right sides per scene, with subtle
-     sway/breathing motion so it doesn't feel like a static cutout.
-  4. Captions are generated from the narration text, timed proportionally across the
-     scene's audio duration, and rendered as a bold bar near the TOP of the frame
-     (video-game dialogue style) rather than traditional bottom subtitles.
-  5. Backgrounds use a stronger cartoon-styled prompt plus a real color/contrast
-     boost in post-processing for a more vivid, less flat look.
-  Note: no lip-sync or blinking in this version -- removed by request for simplicity.
+  1. The character is a FIXED reference image (assets/character/character.png) -- not
+     regenerated per scene. It's placed on alternating left/right sides per scene,
+     with subtle sway/breathing motion so it doesn't feel like a static cutout.
+  2. The background is a solid flat color (BACKGROUND_COLOR below), matching the
+     reference art style -- not an AI-generated scene image.
+  3. Captions are built from the narration text, timed proportionally across the
+     scene's audio duration, and revealed progressively WORD BY WORD as if being
+     typed/spoken (karaoke style), rendered near the top of the frame in bold
+     uppercase with a black stroke outline. Content words are highlighted in yellow,
+     matching the reference caption mockup.
 
 Usage:
     python generate_video.py --script scripts/example_script.txt --out output/final_video.mp4
@@ -29,49 +26,33 @@ import argparse
 import math
 import os
 import random
-import re
 import shutil
 import subprocess
 import sys
-import time
 from pathlib import Path
-from urllib.parse import quote
 
-import requests
-from PIL import Image, ImageDraw, ImageEnhance, ImageFont
+from PIL import Image, ImageDraw, ImageFont
 
 CANVAS_W, CANVAS_H = 1920, 1080
 FPS = 25
-POLLINATIONS_BASE = "https://image.pollinations.ai/prompt"
-ANIME_STYLE_SUFFIX = (", vivid cartoon illustration, bold clean outlines, saturated colors, "
-                      "dynamic cartoon lighting, exaggerated cartoon style, hand-drawn animation "
-                      "background art, no photorealism, no muted colors")
 DEFAULT_VOICE_SAMPLE = "voice_samples/Bee.m4a"
+CHARACTER_PATH = Path(__file__).parent / "assets" / "character" / "character.png"
 
-CHARACTER_IDENTITY = (
-    "a single solo chibi anime girl, one character only, one pose only, no other people, "
-    "Mikasa-inspired, short black bob hair, red scarf, big expressive dark eyes, "
-    "simple black long-sleeve top, full body, standing, front facing, centered in frame, "
-    "plain flat pastel background, hand-drawn digital illustration style, webtoon art, "
-    "bold clean linework, cel shaded, vivid saturated colors, isolated single figure"
-)
+# Sampled directly from Saba's reference art
+BACKGROUND_COLOR = (246, 225, 200)
 
-EXPRESSION_RULES = [
-    (r"\b(happy|excited|great|love|joy|smile|amazing|wonderful|fun)\b", "bright happy smile, cheerful expression"),
-    (r"\b(think|wonder|maybe|consider|hmm|question|why|how|curious)\b", "thoughtful pensive expression, hand near chin"),
-    (r"\b(wow|shock|surprised|suddenly|what\?|can't believe|whoa)\b", "surprised expression, wide eyes, eyebrows raised"),
-    (r"\b(sad|hard|difficult|tired|hurt|lonely|cry|lost)\b", "soft melancholic expression, gentle downward gaze"),
-]
-DEFAULT_EXPRESSION = "calm gentle expression, soft smile"
-
-MAX_ACCEPTABLE_ASPECT_RATIO = 0.85  # catches multi-character grids slipping past the prompt
-MAX_POSE_GENERATION_ATTEMPTS = 4
-
-CAPTION_WORDS_PER_CHUNK = 6
+CAPTION_WORDS_PER_LINE = 6
 CAPTION_FONT_CANDIDATES = [
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
     "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
 ]
+# Small words rendered in plain white; everything else highlighted yellow,
+# matching the reference caption mockup (HELLO plain, EXCITED/LEARN/EXPLORE yellow).
+CAPTION_STOPWORDS = {
+    "a", "an", "the", "is", "it", "to", "of", "in", "on", "at", "for", "and", "but",
+    "or", "so", "i", "i'm", "im", "you", "your", "we", "us", "me", "my", "with",
+    "let's", "lets", "that", "this", "be", "was", "were", "are", "am", "just",
+}
 
 
 def parse_script(path: str):
@@ -97,19 +78,15 @@ def parse_script(path: str):
         if not block:
             continue
         lines = [l for l in block.splitlines() if l.strip()]
-        image_prompt = None
         narration_lines = []
         for line in lines:
-            if line.upper().startswith("IMAGE:") and image_prompt is None:
-                image_prompt = line.split(":", 1)[1].strip()
-            else:
-                narration_lines.append(line.strip())
+            if line.upper().startswith("IMAGE:"):
+                continue  # image prompts are no longer used (fixed background)
+            narration_lines.append(line.strip())
         narration = " ".join(narration_lines).strip()
         if not narration:
             continue
-        if not image_prompt:
-            image_prompt = narration[:200]
-        scenes.append({"image_prompt": image_prompt, "narration": narration})
+        scenes.append({"narration": narration})
 
     if not scenes:
         raise ValueError("No scenes found. Separate scenes with '---' lines.")
@@ -131,70 +108,6 @@ class ClonedVoice:
         )
 
 
-def fetch_pollinations_image(prompt: str, out_path: Path, width, height, model="flux-anime", retries=4, seed=None):
-    seed = seed if seed is not None else random.randint(1, 999_999)
-    url = (f"{POLLINATIONS_BASE}/{quote(prompt)}?width={width}&height={height}"
-           f"&seed={seed}&nologo=true&model={model}")
-    fallback_url = (f"{POLLINATIONS_BASE}/{quote(prompt)}?width={width}&height={height}"
-                     f"&seed={seed}&nologo=true")
-    last_err = None
-    for attempt in range(1, retries + 1):
-        try:
-            try_url = url if attempt <= retries - 1 else fallback_url
-            resp = requests.get(try_url, timeout=120)
-            resp.raise_for_status()
-            out_path.write_bytes(resp.content)
-            if out_path.stat().st_size > 5000:
-                return
-            last_err = "image response too small"
-        except Exception as e:  # noqa: BLE001
-            last_err = str(e)
-        print(f"  [image] attempt {attempt} failed ({last_err}), retrying...")
-        time.sleep(3 * attempt)
-    raise RuntimeError(f"Failed to fetch image for prompt {prompt!r}: {last_err}")
-
-
-def pick_expression(narration: str) -> str:
-    lowered = narration.lower()
-    for pattern, expression in EXPRESSION_RULES:
-        if re.search(pattern, lowered):
-            return expression
-    return DEFAULT_EXPRESSION
-
-
-def autocrop_to_content(img: Image.Image) -> Image.Image:
-    bbox = img.getbbox()
-    return img.crop(bbox) if bbox else img
-
-
-def generate_character_pose(scene: dict, workdir: Path, index: int) -> Image.Image:
-    """Generates one context-appropriate character pose, background-removed and
-    cropped to content. Retries if the result looks like a multi-character grid."""
-    from rembg import remove
-
-    expression = pick_expression(scene["narration"])
-    prompt = f"{CHARACTER_IDENTITY}, {expression}"
-
-    last_cutout = None
-    for attempt in range(1, MAX_POSE_GENERATION_ATTEMPTS + 1):
-        raw_path = workdir / f"char_{index:03}_raw_{attempt}.png"
-        fetch_pollinations_image(prompt, raw_path, 768, 1024, model="flux-anime")
-
-        raw_img = Image.open(raw_path).convert("RGBA")
-        cutout = remove(raw_img)
-        cutout = autocrop_to_content(cutout)
-        last_cutout = cutout
-
-        aspect_ratio = cutout.width / cutout.height
-        if aspect_ratio <= MAX_ACCEPTABLE_ASPECT_RATIO:
-            return cutout
-        print(f"  [character] attempt {attempt} looked like multiple characters "
-              f"(aspect ratio {aspect_ratio:.2f}), regenerating...")
-
-    print("  [character] all attempts looked wide; using the last one anyway.")
-    return last_cutout
-
-
 def run(cmd, **kwargs):
     result = subprocess.run(cmd, capture_output=True, text=True, **kwargs)
     if result.returncode != 0:
@@ -210,29 +123,44 @@ def get_duration(path: Path) -> float:
     return float(result.stdout.strip())
 
 
-def build_caption_chunks(narration: str, duration: float):
-    """Splits narration into small on-screen chunks, timed proportionally to each
-    chunk's word count across the scene's audio duration (even-pace approximation --
-    there's no forced word-alignment step in this simplified pipeline)."""
+def load_character() -> Image.Image:
+    if not CHARACTER_PATH.exists():
+        raise FileNotFoundError(
+            f"Character art not found at {CHARACTER_PATH}. Upload character.png to "
+            "assets/character/ (via GitHub's Upload files UI) before running this."
+        )
+    return Image.open(CHARACTER_PATH).convert("RGBA")
+
+
+def build_caption_lines(narration: str, duration: float):
+    """Splits narration into on-screen lines, each with per-word start times (relative
+    to the scene start) so words can be revealed progressively as if being spoken."""
     words = narration.split()
     if not words:
         return []
     per_word = duration / len(words)
-    chunks = []
+
+    lines = []
     t = 0.0
-    for i in range(0, len(words), CAPTION_WORDS_PER_CHUNK):
-        chunk_words = words[i:i + CAPTION_WORDS_PER_CHUNK]
-        chunk_dur = per_word * len(chunk_words)
-        chunks.append({"start": t, "end": t + chunk_dur, "text": " ".join(chunk_words)})
-        t += chunk_dur
-    return chunks
+    for i in range(0, len(words), CAPTION_WORDS_PER_LINE):
+        chunk_words = words[i:i + CAPTION_WORDS_PER_LINE]
+        word_entries = []
+        wt = t
+        for w in chunk_words:
+            word_entries.append({"word": w, "start": wt})
+            wt += per_word
+        line_end = wt
+        lines.append({"start": t, "end": line_end, "words": word_entries})
+        t = line_end
+    return lines
 
 
-def caption_at(chunks, t: float):
-    for c in chunks:
-        if c["start"] <= t < c["end"]:
-            return c["text"]
-    return ""
+def revealed_text_at(lines, t: float):
+    for line in lines:
+        if line["start"] <= t < line["end"]:
+            revealed = [w["word"] for w in line["words"] if w["start"] <= t]
+            return revealed
+    return None
 
 
 def load_caption_font(size: int):
@@ -242,48 +170,49 @@ def load_caption_font(size: int):
     return ImageFont.load_default()
 
 
-def draw_caption(draw: ImageDraw.ImageDraw, text: str, canvas_w: int, font, top_y: int):
-    if not text:
-        return
-    bbox = draw.textbbox((0, 0), text, font=font, stroke_width=6)
+def is_highlighted(word: str) -> bool:
+    stripped = word.strip(".,!?;:\"'").lower()
+    return stripped not in CAPTION_STOPWORDS and len(stripped) > 0
+
+
+def render_caption_overlay(words: list, canvas_w: int, font, top_y: int) -> Image.Image:
+    """Renders the revealed words as a single centered line, uppercase, with
+    per-word yellow/white coloring and a bold black stroke outline (video-game
+    caption style), on a semi-transparent rounded bar."""
+    if not words:
+        return Image.new("RGBA", (canvas_w, top_y + 40), (0, 0, 0, 0))
+
+    display_words = [w.upper() for w in words]
+    spacer = " "
+    full_text = spacer.join(display_words)
+
+    measure_img = Image.new("RGBA", (canvas_w, 400), (0, 0, 0, 0))
+    measure_draw = ImageDraw.Draw(measure_img)
+    bbox = measure_draw.textbbox((0, 0), full_text, font=font, stroke_width=6)
     text_w = bbox[2] - bbox[0]
     text_h = bbox[3] - bbox[1]
-    x = (canvas_w - text_w) // 2
 
-    pad_x, pad_y = 28, 16
-    bar_box = (x - pad_x, top_y - pad_y, x + text_w + pad_x, top_y + text_h + pad_y)
+    pad_x, pad_y = 32, 18
     overlay = Image.new("RGBA", (canvas_w, top_y + text_h + pad_y * 3), (0, 0, 0, 0))
-    overlay_draw = ImageDraw.Draw(overlay)
-    overlay_draw.rounded_rectangle(bar_box, radius=18, fill=(15, 15, 20, 190))
-    overlay_draw.text((x, top_y), text, font=font, fill=(255, 255, 255, 255),
-                       stroke_width=6, stroke_fill=(20, 20, 25, 255))
+    draw = ImageDraw.Draw(overlay)
+
+    x = (canvas_w - text_w) // 2
+    bar_box = (x - pad_x, top_y - pad_y, x + text_w + pad_x, top_y + text_h + pad_y)
+    draw.rounded_rectangle(bar_box, radius=20, fill=(15, 15, 20, 190))
+
+    cursor_x = x
+    for original_word, disp_word in zip(words, display_words):
+        color = (255, 214, 10, 255) if is_highlighted(original_word) else (255, 255, 255, 255)
+        draw.text((cursor_x, top_y), disp_word, font=font, fill=color,
+                   stroke_width=6, stroke_fill=(20, 20, 25, 255))
+        word_bbox = draw.textbbox((cursor_x, top_y), disp_word + " ", font=font, stroke_width=6)
+        cursor_x = word_bbox[2]
+
     return overlay
 
 
-def prepare_background(image_path: Path, width, height) -> Image.Image:
-    img = Image.open(image_path).convert("RGB")
-    src_ratio = img.width / img.height
-    dst_ratio = width / height
-    if src_ratio > dst_ratio:
-        new_h = height
-        new_w = int(height * src_ratio)
-    else:
-        new_w = width
-        new_h = int(width / src_ratio)
-    img = img.resize((new_w, new_h))
-    left = (new_w - width) // 2
-    top = (new_h - height) // 2
-    img = img.crop((left, top, left + width, top + height))
-
-    # Real color/contrast boost so backgrounds read as vivid cartoon art, not flat AI-image output
-    img = ImageEnhance.Color(img).enhance(1.35)
-    img = ImageEnhance.Contrast(img).enhance(1.15)
-    img = ImageEnhance.Sharpness(img).enhance(1.2)
-    return img
-
-
-def render_scene(background: Image.Image, char_img: Image.Image, caption_chunks, side: str,
-                  duration: float, audio_path: Path, out_path: Path, char_scale=0.85, fps=FPS):
+def render_scene(char_img: Image.Image, caption_lines, side: str, duration: float,
+                  audio_path: Path, out_path: Path, char_scale=0.85, fps=FPS):
     char_h = int(CANVAS_H * char_scale)
     char_w = int(char_h * char_img.width / char_img.height)
     margin = int(CANVAS_W * 0.05)
@@ -304,11 +233,11 @@ def render_scene(background: Image.Image, char_img: Image.Image, caption_chunks,
         str(out_path), "-loglevel", "error",
     ]
     proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE)
-    bg_rgba = background.convert("RGBA")
 
+    bg = Image.new("RGBA", (CANVAS_W, CANVAS_H), (*BACKGROUND_COLOR, 255))
     sway_phase = random.uniform(0, math.pi * 2)
     breathe_phase = random.uniform(0, math.pi * 2)
-    last_caption_text = None
+    last_revealed_key = None
     caption_overlay = None
 
     for i in range(total_frames):
@@ -328,16 +257,15 @@ def render_scene(background: Image.Image, char_img: Image.Image, caption_chunks,
         paste_x = anchor_x + sway - (transformed.width - char_w) // 2
         paste_y = anchor_y + bob - (transformed.height - char_h) // 2
 
-        frame = bg_rgba.copy()
+        frame = bg.copy()
         frame.alpha_composite(transformed, (paste_x, paste_y))
 
-        caption_text = caption_at(caption_chunks, t)
-        if caption_text != last_caption_text:
-            caption_draw_target = Image.new("RGBA", frame.size, (0, 0, 0, 0))
-            d = ImageDraw.Draw(caption_draw_target)
-            caption_overlay = draw_caption(d, caption_text, CANVAS_W, font, caption_top_y)
-            last_caption_text = caption_text
-        if caption_overlay is not None and caption_text:
+        revealed = revealed_text_at(caption_lines, t)
+        revealed_key = tuple(revealed) if revealed else None
+        if revealed_key != last_revealed_key:
+            caption_overlay = render_caption_overlay(revealed or [], CANVAS_W, font, caption_top_y)
+            last_revealed_key = revealed_key
+        if caption_overlay is not None and revealed:
             frame.alpha_composite(caption_overlay, (0, 0))
 
         proc.stdin.write(frame.convert("RGB").tobytes())
@@ -365,7 +293,7 @@ def add_background_music(video_path: Path, music_path: Path, out_path: Path, vol
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Generate a Mikasan-narrated cartoon with left/right character placement and top captions.")
+    ap = argparse.ArgumentParser(description="Generate a Mikasan-narrated cartoon with a fixed character, solid background, and karaoke captions.")
     ap.add_argument("--script", required=True)
     ap.add_argument("--out", default="output/final_video.mp4")
     ap.add_argument("--voice-sample", default=None)
@@ -387,13 +315,13 @@ def main():
     workdir.mkdir(parents=True)
 
     print(f"Loaded {len(scenes)} scene(s). Voice sample: {voice_sample}. Music: {music or 'none'}")
+    char_img = load_character()
     voice = ClonedVoice(Path(voice_sample), language=args.language)
 
     clip_paths = []
     for i, scene in enumerate(scenes):
         print(f"\n[{i+1}/{len(scenes)}] {scene['narration'][:70]}...")
         audio_wav = workdir / f"scene_{i:03}.wav"
-        bg_image_path = workdir / f"scene_{i:03}_bg.jpg"
         clip_path = workdir / f"scene_{i:03}.mp4"
         side = "left" if i % 2 == 0 else "right"
 
@@ -401,18 +329,11 @@ def main():
         voice.synth(scene["narration"], audio_wav)
         duration = get_duration(audio_wav) + 0.3
 
-        caption_chunks = build_caption_chunks(scene["narration"], duration)
-
-        print("  -> generating context-driven character pose")
-        char_img = generate_character_pose(scene, workdir, i)
-
-        print(f"  -> generating background: {scene['image_prompt'][:70]}...")
-        fetch_pollinations_image(f"{scene['image_prompt']}{ANIME_STYLE_SUFFIX}", bg_image_path, CANVAS_W, CANVAS_H)
-        background = prepare_background(bg_image_path, CANVAS_W, CANVAS_H)
+        caption_lines = build_caption_lines(scene["narration"], duration)
 
         print(f"  -> rendering scene ({side} side, {duration:.1f}s, {int(duration*FPS)} frames)")
-        render_scene(background, char_img, caption_chunks, side, duration, audio_wav,
-                     clip_path, char_scale=args.character_scale)
+        render_scene(char_img, caption_lines, side, duration, audio_wav, clip_path,
+                     char_scale=args.character_scale)
         clip_paths.append(clip_path)
 
     print("\nConcatenating all scenes...")
