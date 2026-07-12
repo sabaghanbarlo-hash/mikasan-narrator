@@ -24,15 +24,7 @@ jobs:
           python-version: '3.10'
 
       - name: Install ffmpeg
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
-
-      - name: Install Rhubarb Lip Sync
-        run: |
-          curl -L -o rhubarb.zip https://github.com/DanielSWolf/rhubarb-lip-sync/releases/download/v1.13.0/Rhubarb-Lip-Sync-1.13.0-Linux.zip
-          unzip -q rhubarb.zip -d rhubarb_extracted
-          sudo mv rhubarb_extracted/Rhubarb-Lip-Sync-1.13.0-Linux/rhubarb /usr/local/bin/rhubarb
-          sudo chmod +x /usr/local/bin/rhubarb
-          rhubarb --version || echo "Rhubarb install check failed, pipeline will fall back to approximate lip-sync"
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg fonts-dejavu
 
       - name: Install Python dependencies
         env:
