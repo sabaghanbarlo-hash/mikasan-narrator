@@ -1,10 +1,8 @@
 requests
 Pillow
-numpy
 TTS
 rembg
 onnxruntime
-opencv-python-headless
 # Coqui TTS's XTTS module needs older/compatible deps than latest PyPI defaults
 transformers==4.39.3
 tokenizers==0.15.2
