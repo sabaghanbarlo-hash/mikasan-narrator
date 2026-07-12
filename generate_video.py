@@ -9,15 +9,17 @@ context, plus lip-sync and blinking -- all free, no API keys.
 HOW THE CHARACTER WORKS (no hand-drawn art required):
   1. Each scene's narration is scanned for simple emotion cues (happy/thinking/
      surprised/neutral) to pick an expression prompt.
-  2. Pollinations.ai generates ONE character pose image for that scene, on a plain
-     background, in the fixed Mikasan style.
+  2. Pollinations.ai generates ONE character pose image for that scene, styled as
+     hand-drawn digital illustration (not a photoreal AI-image look).
   3. Background removal (rembg) isolates the character onto a transparent PNG.
-  4. Mouth/eye states for lip-sync and blinking are drawn directly onto THAT SAME
-     image (not separately generated), so they stay perfectly aligned -- this trades
-     precise hand-drawn mouth shapes for guaranteed consistency.
+  4. A real anime-face detector (lbpcascade_animeface, OpenCV) locates the actual
+     face in the generated image. Mouth/eye states for lip-sync and blinking are
+     drawn relative to THAT DETECTED FACE (not guessed fixed positions), directly
+     onto the same image so they stay aligned.
+  5. Subtle sway/breathing motion is added at render time so the character doesn't
+     look like a stiff static cutout.
   Note: arm/gesture animation is not supported in this AI-generated mode (no reliable
-  way to isolate and reposition a limb from a flat generated image). Idle bob motion
-  still applies since that just repositions the whole character.
+  way to isolate and reposition a limb from a flat generated image).
 
 Usage:
     python generate_video.py --script scripts/example_script.txt --out output/final_video.mp4
@@ -36,26 +38,29 @@ import time
 from pathlib import Path
 from urllib.parse import quote
 
+import numpy as np
 import requests
 from PIL import Image, ImageDraw
 
 CANVAS_W, CANVAS_H = 1920, 1080
 FPS = 25
 POLLINATIONS_BASE = "https://image.pollinations.ai/prompt"
-ANIME_STYLE_SUFFIX = (", anime background art, cel shaded, Studio Ghibli inspired, hand-painted anime "
-                      "illustration, vibrant anime color palette, no photorealism")
+ANIME_STYLE_SUFFIX = (", hand-drawn digital illustration, webtoon style, digital painting, "
+                      "clean linework, cel shaded, vibrant anime color palette, no photorealism")
 DEFAULT_VOICE_SAMPLE = "voice_samples/Bee.m4a"
+FACE_CASCADE_URL = "https://raw.githubusercontent.com/nagadomi/lbpcascade_animeface/master/lbpcascade_animeface.xml"
 
 # Fixed identity so the character reads as "the same character" across scenes even
 # though each pose is a fresh generation. Keep this description consistent.
 # IMPORTANT: avoid words like "character sheet" / "reference sheet" / "turnaround" --
-# image models read those as a request for a multi-pose grid (front/side/back), which
-# produces several copies of the character in one image instead of a single pose.
+# image models read those as a request for a multi-pose grid, producing several
+# copies of the character in one image instead of a single pose.
 CHARACTER_IDENTITY = (
     "a single solo chibi anime girl, one character only, one pose only, no other people, "
     "Mikasa-inspired, short black bob hair, red scarf, big expressive dark eyes, "
     "simple black long-sleeve top, full body, standing, front facing, centered in frame, "
-    "plain flat pastel background, clean line art, cel shaded, isolated single figure"
+    "plain flat pastel background, hand-drawn digital illustration style, webtoon art, "
+    "clean linework, cel shaded, isolated single figure"
 )
 
 EXPRESSION_RULES = [
@@ -66,17 +71,19 @@ EXPRESSION_RULES = [
 ]
 DEFAULT_EXPRESSION = "calm gentle expression, soft smile"
 
-# Approximate proportions (fractions of the character's cropped bounding box) where
-# facial features tend to land for a front-facing chibi character pose.
-EYE_L_REGION = (0.34, 0.30, 0.46, 0.38)
-EYE_R_REGION = (0.54, 0.30, 0.66, 0.38)
-MOUTH_REGION = (0.42, 0.42, 0.58, 0.50)
+# Fallback proportions (fractions of the whole cropped body) ONLY used if face
+# detection fails on a given image -- real face detection is tried first.
+FALLBACK_EYE_L_REGION = (0.34, 0.12, 0.46, 0.20)
+FALLBACK_EYE_R_REGION = (0.54, 0.12, 0.66, 0.20)
+FALLBACK_MOUTH_REGION = (0.42, 0.22, 0.58, 0.28)
 
-# A single standing chibi figure should be noticeably taller than wide. If the
-# background-removed cutout is wider than this, it's almost certainly multiple
-# characters side by side (a multi-pose grid slipping past the prompt) -- reject
-# and regenerate rather than silently rendering a broken frame.
-MAX_ACCEPTABLE_ASPECT_RATIO = 0.85  # width / height
+# Where eyes/mouth sit as fractions WITHIN a detected face box (standard proportions
+# for a front-facing anime face).
+FACE_EYE_L_REGION = (0.18, 0.38, 0.42, 0.52)
+FACE_EYE_R_REGION = (0.58, 0.38, 0.82, 0.52)
+FACE_MOUTH_REGION = (0.35, 0.68, 0.65, 0.82)
+
+MAX_ACCEPTABLE_ASPECT_RATIO = 0.85  # width / height; catches multi-character grids
 MAX_POSE_GENERATION_ATTEMPTS = 4
 
 VISEME_MAP = {
@@ -84,6 +91,8 @@ VISEME_MAP = {
     "C": "mid", "E": "mid", "F": "mid", "H": "mid",
     "D": "wide",
 }
+
+_face_cascade = None
 
 
 def parse_script(path: str):
@@ -179,9 +188,43 @@ def autocrop_to_content(img: Image.Image) -> Image.Image:
     return img.crop(bbox) if bbox else img
 
 
-def generate_character_pose(scene: dict, workdir: Path, index: int) -> Image.Image:
-    """Generates one context-appropriate character pose and returns it as a
-    background-removed RGBA image, cropped to its content bounding box.
+def get_face_cascade(workdir: Path):
+    """Downloads (once) and loads the anime face detector cascade."""
+    global _face_cascade
+    if _face_cascade is not None:
+        return _face_cascade
+    import cv2
+
+    cascade_path = workdir / "lbpcascade_animeface.xml"
+    if not cascade_path.exists():
+        resp = requests.get(FACE_CASCADE_URL, timeout=60)
+        resp.raise_for_status()
+        cascade_path.write_bytes(resp.content)
+    _face_cascade = cv2.CascadeClassifier(str(cascade_path))
+    return _face_cascade
+
+
+def detect_face_box(img: Image.Image, workdir: Path):
+    """Returns (left, top, right, bottom) pixel box of the largest detected anime
+    face, or None if no face was found."""
+    import cv2
+
+    cascade = get_face_cascade(workdir)
+    rgb = img.convert("RGB")
+    arr = np.array(rgb)
+    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+    gray = cv2.equalizeHist(gray)
+    faces = cascade.detectMultiScale(gray, scaleFactor=1.05, minNeighbors=3, minSize=(40, 40))
+    if len(faces) == 0:
+        return None
+    # pick the largest detected face box
+    fx, fy, fw, fh = max(faces, key=lambda f: f[2] * f[3])
+    return (int(fx), int(fy), int(fx + fw), int(fy + fh))
+
+
+def generate_character_pose(scene: dict, workdir: Path, index: int):
+    """Generates one context-appropriate character pose. Returns
+    (background-removed RGBA image cropped to content, face_box or None).
 
     Retries if the result looks like a multi-character grid (too wide relative to
     height for a single standing chibi figure) rather than one pose.
@@ -203,12 +246,29 @@ def generate_character_pose(scene: dict, workdir: Path, index: int) -> Image.Ima
 
         aspect_ratio = cutout.width / cutout.height
         if aspect_ratio <= MAX_ACCEPTABLE_ASPECT_RATIO:
-            return cutout
+            face_box = detect_face_box(cutout, workdir)
+            if face_box is None:
+                print(f"  [character] attempt {attempt}: no face detected, using fallback face position.")
+            return cutout, face_box
         print(f"  [character] attempt {attempt} looked like multiple characters "
               f"(aspect ratio {aspect_ratio:.2f}), regenerating...")
 
     print("  [character] all attempts looked wide; using the last one anyway.")
-    return last_cutout
+    return last_cutout, detect_face_box(last_cutout, workdir)
+
+
+def region_in_image_fractions(face_box, region_within_face, img_size):
+    """Converts a region defined as fractions WITHIN a face box into fractions of
+    the whole image, so draw_eye_state/draw_mouth_state (which work in whole-image
+    fractions) can be reused either way."""
+    fx, fy, fx2, fy2 = face_box
+    fw, fh = fx2 - fx, fy2 - fy
+    l, t, r, b = region_within_face
+    iw, ih = img_size
+    return (
+        (fx + l * fw) / iw, (fy + t * fh) / ih,
+        (fx + r * fw) / iw, (fy + b * fh) / ih,
+    )
 
 
 def draw_eye_state(img: Image.Image, region_frac, closed: bool):
@@ -237,15 +297,22 @@ def draw_mouth_state(img: Image.Image, region_frac, state: str):
     )
 
 
-def build_character_states(base_pose: Image.Image):
+def build_character_states(base_pose: Image.Image, face_box):
+    if face_box is not None:
+        eye_l = region_in_image_fractions(face_box, FACE_EYE_L_REGION, base_pose.size)
+        eye_r = region_in_image_fractions(face_box, FACE_EYE_R_REGION, base_pose.size)
+        mouth = region_in_image_fractions(face_box, FACE_MOUTH_REGION, base_pose.size)
+    else:
+        eye_l, eye_r, mouth = FALLBACK_EYE_L_REGION, FALLBACK_EYE_R_REGION, FALLBACK_MOUTH_REGION
+
     frames = {}
     for eyes_state in ("open", "closed"):
         for mouth_state in ("closed", "mid", "wide"):
             frame = base_pose.copy()
             if eyes_state == "closed":
-                draw_eye_state(frame, EYE_L_REGION, True)
-                draw_eye_state(frame, EYE_R_REGION, True)
-            draw_mouth_state(frame, MOUTH_REGION, mouth_state)
+                draw_eye_state(frame, eye_l, True)
+                draw_eye_state(frame, eye_r, True)
+            draw_mouth_state(frame, mouth, mouth_state)
             frames[(eyes_state, mouth_state)] = frame
     return frames
 
@@ -364,15 +431,34 @@ def render_scene(background: Image.Image, char_frames: dict, mouth_cues, blink_s
     proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE)
     bg_rgba = background.convert("RGBA")
 
+    # Slight per-scene randomization so sway doesn't look identical every scene
+    sway_phase = random.uniform(0, math.pi * 2)
+    breathe_phase = random.uniform(0, math.pi * 2)
+
     for i in range(total_frames):
         t = i / fps
         mouth_state = mouth_state_at(mouth_cues, t) if mouth_cues else "closed"
         eyes_state = "closed" if is_blinking(blink_schedule, t) else "open"
         char_img = resized_cache[(eyes_state, mouth_state)]
 
+        # Natural motion: vertical bob (existing), horizontal sway, slight rotation,
+        # and a gentle breathing scale pulse -- keeps a static cutout from feeling stiff.
         bob = int(5 * math.sin(2 * math.pi * t / 2.6))
+        sway = int(4 * math.sin(2 * math.pi * t / 3.4 + sway_phase))
+        rotation = 1.4 * math.sin(2 * math.pi * t / 4.1 + sway_phase)
+        breathe_scale = 1.0 + 0.012 * math.sin(2 * math.pi * t / 3.0 + breathe_phase)
+
+        transformed = char_img.rotate(rotation, resample=Image.BICUBIC, expand=False)
+        if breathe_scale != 1.0:
+            new_w = int(transformed.width * breathe_scale)
+            new_h = int(transformed.height * breathe_scale)
+            transformed = transformed.resize((new_w, new_h), Image.LANCZOS)
+
+        paste_x = anchor_x + sway - (transformed.width - char_w) // 2
+        paste_y = anchor_y + bob - (transformed.height - char_h) // 2
+
         frame = bg_rgba.copy()
-        frame.alpha_composite(char_img, (anchor_x, anchor_y + bob))
+        frame.alpha_composite(transformed, (paste_x, paste_y))
         proc.stdin.write(frame.convert("RGB").tobytes())
 
     proc.stdin.close()
@@ -441,9 +527,9 @@ def main():
             mouth_cues = approximate_mouth_cues(audio_wav, duration)
         blink_schedule = make_blink_schedule(duration)
 
-        print("  -> generating context-driven character pose")
-        base_pose = generate_character_pose(scene, workdir, i)
-        char_frames = build_character_states(base_pose)
+        print("  -> generating context-driven character pose (with face detection)")
+        base_pose, face_box = generate_character_pose(scene, workdir, i)
+        char_frames = build_character_states(base_pose, face_box)
 
         print(f"  -> generating background: {scene['image_prompt'][:70]}...")
         fetch_pollinations_image(f"{scene['image_prompt']}{ANIME_STYLE_SUFFIX}", bg_image_path, CANVAS_W, CANVAS_H)
