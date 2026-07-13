@@ -13,10 +13,10 @@ HOW IT WORKS:
   2. The background is a solid flat color (BACKGROUND_COLOR below), matching the
      reference art style -- not an AI-generated scene image.
   3. Captions are built from the narration text, timed proportionally across the
-     scene's audio duration, and revealed progressively WORD BY WORD as if being
-     typed/spoken (karaoke style), rendered near the top of the frame in bold
-     uppercase with a black stroke outline. Content words are highlighted in yellow,
-     matching the reference caption mockup.
+     scene's audio duration (with a lead-time offset so they don't lag behind the
+     voice), and revealed progressively WORD BY WORD (karaoke style). Rendered on the
+     RIGHT side of the frame, comic-speech-bubble style, in bold uppercase with a
+     black stroke outline. Content words are highlighted in yellow.
 
 Usage:
     python generate_video.py --script scripts/example_script.txt --out output/final_video.mp4
@@ -42,6 +42,14 @@ CHARACTER_PATH = Path(__file__).parent / "assets" / "character" / "character.png
 BACKGROUND_COLOR = (246, 225, 200)
 
 CAPTION_WORDS_PER_LINE = 6
+# Captions were lagging behind the voice -- pull each word's reveal time earlier and
+# compress the pacing a bit so text keeps up with (or slightly leads) speech.
+CAPTION_LEAD_TIME = 0.35
+CAPTION_SPEED_FACTOR = 0.78
+# Right side, lower than a top banner -- comic speech-bubble placement rather than
+# a top-of-screen game HUD.
+CAPTION_TOP_Y = 340
+CAPTION_RIGHT_MARGIN = 90
 CAPTION_FONT_CANDIDATES = [
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
     "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
@@ -134,11 +142,12 @@ def load_character() -> Image.Image:
 
 def build_caption_lines(narration: str, duration: float):
     """Splits narration into on-screen lines, each with per-word start times (relative
-    to the scene start) so words can be revealed progressively as if being spoken."""
+    to the scene start) so words can be revealed progressively as if being spoken.
+    Timing is compressed and lead-shifted so captions don't lag behind the voice."""
     words = narration.split()
     if not words:
         return []
-    per_word = duration / len(words)
+    per_word = (duration / len(words)) * CAPTION_SPEED_FACTOR
 
     lines = []
     t = 0.0
@@ -147,11 +156,11 @@ def build_caption_lines(narration: str, duration: float):
         word_entries = []
         wt = t
         for w in chunk_words:
-            word_entries.append({"word": w, "start": wt})
+            word_entries.append({"word": w, "start": max(0.0, wt - CAPTION_LEAD_TIME)})
             wt += per_word
-        line_end = wt
-        lines.append({"start": t, "end": line_end, "words": word_entries})
-        t = line_end
+        line_end = max(wt, wt - CAPTION_LEAD_TIME) + CAPTION_LEAD_TIME
+        lines.append({"start": max(0.0, t - CAPTION_LEAD_TIME), "end": line_end, "words": word_entries})
+        t = wt
     return lines
 
 
@@ -175,10 +184,10 @@ def is_highlighted(word: str) -> bool:
     return stripped not in CAPTION_STOPWORDS and len(stripped) > 0
 
 
-def render_caption_overlay(words: list, canvas_w: int, font, top_y: int) -> Image.Image:
-    """Renders the revealed words as a single centered line, uppercase, with
-    per-word yellow/white coloring and a bold black stroke outline (video-game
-    caption style), on a semi-transparent rounded bar."""
+def render_caption_overlay(words: list, canvas_w: int, font, top_y: int, right_margin: int) -> Image.Image:
+    """Renders the revealed words as a single right-aligned line, uppercase, with
+    per-word yellow/white coloring and a bold black stroke outline (comic
+    speech-bubble style), on a semi-transparent rounded bar positioned on the right."""
     if not words:
         return Image.new("RGBA", (canvas_w, top_y + 40), (0, 0, 0, 0))
 
@@ -196,7 +205,8 @@ def render_caption_overlay(words: list, canvas_w: int, font, top_y: int) -> Imag
     overlay = Image.new("RGBA", (canvas_w, top_y + text_h + pad_y * 3), (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
 
-    x = (canvas_w - text_w) // 2
+    # Right-aligned instead of centered
+    x = canvas_w - right_margin - text_w
     bar_box = (x - pad_x, top_y - pad_y, x + text_w + pad_x, top_y + text_h + pad_y)
     draw.rounded_rectangle(bar_box, radius=20, fill=(15, 15, 20, 190))
 
@@ -223,7 +233,6 @@ def render_scene(char_img: Image.Image, caption_lines, side: str, duration: floa
     total_frames = max(int(duration * fps), fps)
 
     font = load_caption_font(52)
-    caption_top_y = 60
 
     ffmpeg_cmd = [
         "ffmpeg", "-y",
@@ -263,7 +272,7 @@ def render_scene(char_img: Image.Image, caption_lines, side: str, duration: floa
         revealed = revealed_text_at(caption_lines, t)
         revealed_key = tuple(revealed) if revealed else None
         if revealed_key != last_revealed_key:
-            caption_overlay = render_caption_overlay(revealed or [], CANVAS_W, font, caption_top_y)
+            caption_overlay = render_caption_overlay(revealed or [], CANVAS_W, font, CAPTION_TOP_Y, CAPTION_RIGHT_MARGIN)
             last_revealed_key = revealed_key
         if caption_overlay is not None and revealed:
             frame.alpha_composite(caption_overlay, (0, 0))
