@@ -4,33 +4,37 @@ Mikasan Narrator - long-form cartoon generator
 -----------------------------------------------
 Turns a plain-text script into a video narrated in Saba's own cloned voice, with the
 fixed Mikasan character (assets/character/character.png), a solid tan background, and
-karaoke-style animated captions synced to the narration -- all free, no API keys.
+typewriter-style accumulating captions synced to the narration -- all free, no API keys.
 
 HOW IT WORKS:
-  1. The character is a FIXED reference image (assets/character/character.png) -- not
-     regenerated per scene. It's placed on alternating left/right sides per scene,
-     with subtle sway/breathing motion so it doesn't feel like a static cutout.
+  1. The character is a FIXED reference image (assets/character/character.png), held
+     static (no idle sway) and placed on alternating left/right sides per scene.
   2. The background is a solid flat color (BACKGROUND_COLOR below), matching the
-     reference art style -- not an AI-generated scene image.
-  3. Captions are built from the narration text, timed proportionally across the
-     scene's audio duration (with a lead-time offset so they don't lag behind the
-     voice), and revealed progressively WORD BY WORD (karaoke style). Rendered on the
-     RIGHT side of the frame, comic-speech-bubble style, in bold uppercase with a
-     black stroke outline. Content words are highlighted in yellow.
+     reference art style.
+  3. Captions build up word by word (typewriter/karaoke style) and ACCUMULATE across
+     multiple lines -- previous words stay on screen as new ones are added -- until
+     the caption block is full, at which point it clears and starts over. Rendered on
+     the right side, lower on the frame (comic speech-bubble style), in a soft rounded
+     font (Baloo 2) with content words highlighted in yellow.
+
+NOTE ON CHARACTER VARIETY: right now there's only one pose (character.png), so the
+character is fully static. The code below is structured so that if you add more pose
+images (e.g. assets/character/pose_gesture.png for a hand-raised pose), it's a small
+change to swap between them periodically -- ask Claude to wire that up once you have
+more art in the same style.
 
 Usage:
     python generate_video.py --script scripts/example_script.txt --out output/final_video.mp4
 """
 
 import argparse
-import math
 import os
-import random
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
+import requests
 from PIL import Image, ImageDraw, ImageFont
 
 CANVAS_W, CANVAS_H = 1920, 1080
@@ -41,16 +45,20 @@ CHARACTER_PATH = Path(__file__).parent / "assets" / "character" / "character.png
 # Sampled directly from Saba's reference art
 BACKGROUND_COLOR = (246, 225, 200)
 
-CAPTION_WORDS_PER_LINE = 6
 # Captions were lagging behind the voice -- pull each word's reveal time earlier and
 # compress the pacing a bit so text keeps up with (or slightly leads) speech.
 CAPTION_LEAD_TIME = 0.35
 CAPTION_SPEED_FACTOR = 0.78
-# Right side, lower than a top banner -- comic speech-bubble placement rather than
-# a top-of-screen game HUD.
-CAPTION_TOP_Y = 340
+
+# Right side, lower than a top banner -- comic speech-bubble placement.
+CAPTION_TOP_Y = 300
 CAPTION_RIGHT_MARGIN = 90
-CAPTION_FONT_CANDIDATES = [
+CAPTION_BOX_WIDTH = 760
+CAPTION_MAX_LINES = 4
+CAPTION_FONT_SIZE = 50
+CAPTION_FONT_WEIGHT = 600  # Baloo 2 variable-weight axis value (semi-bold)
+CAPTION_FONT_URL = "https://raw.githubusercontent.com/google/fonts/main/ofl/baloo2/Baloo2%5Bwght%5D.ttf"
+CAPTION_FONT_FALLBACKS = [
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
     "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
 ]
@@ -89,7 +97,7 @@ def parse_script(path: str):
         narration_lines = []
         for line in lines:
             if line.upper().startswith("IMAGE:"):
-                continue  # image prompts are no longer used (fixed background)
+                continue
             narration_lines.append(line.strip())
         narration = " ".join(narration_lines).strip()
         if not narration:
@@ -140,43 +148,27 @@ def load_character() -> Image.Image:
     return Image.open(CHARACTER_PATH).convert("RGBA")
 
 
-def build_caption_lines(narration: str, duration: float):
-    """Splits narration into on-screen lines, each with per-word start times (relative
-    to the scene start) so words can be revealed progressively as if being spoken.
-    Timing is compressed and lead-shifted so captions don't lag behind the voice."""
-    words = narration.split()
-    if not words:
-        return []
-    per_word = (duration / len(words)) * CAPTION_SPEED_FACTOR
-
-    lines = []
-    t = 0.0
-    for i in range(0, len(words), CAPTION_WORDS_PER_LINE):
-        chunk_words = words[i:i + CAPTION_WORDS_PER_LINE]
-        word_entries = []
-        wt = t
-        for w in chunk_words:
-            word_entries.append({"word": w, "start": max(0.0, wt - CAPTION_LEAD_TIME)})
-            wt += per_word
-        line_end = max(wt, wt - CAPTION_LEAD_TIME) + CAPTION_LEAD_TIME
-        lines.append({"start": max(0.0, t - CAPTION_LEAD_TIME), "end": line_end, "words": word_entries})
-        t = wt
-    return lines
-
-
-def revealed_text_at(lines, t: float):
-    for line in lines:
-        if line["start"] <= t < line["end"]:
-            revealed = [w["word"] for w in line["words"] if w["start"] <= t]
-            return revealed
-    return None
-
-
-def load_caption_font(size: int):
-    for path in CAPTION_FONT_CANDIDATES:
-        if Path(path).exists():
-            return ImageFont.truetype(path, size)
-    return ImageFont.load_default()
+def load_caption_font(workdir: Path, size: int = CAPTION_FONT_SIZE):
+    """Downloads (once) and loads Baloo 2, a soft rounded font, set to a semi-bold
+    weight. Falls back to a system bold font if the download fails."""
+    font_path = workdir / "Baloo2.ttf"
+    try:
+        if not font_path.exists():
+            resp = requests.get(CAPTION_FONT_URL, timeout=30)
+            resp.raise_for_status()
+            font_path.write_bytes(resp.content)
+        font = ImageFont.truetype(str(font_path), size)
+        try:
+            font.set_variation_by_axes([CAPTION_FONT_WEIGHT])
+        except Exception:  # noqa: BLE001
+            pass
+        return font
+    except Exception as e:  # noqa: BLE001
+        print(f"  [font] Baloo 2 download/load failed ({e}), falling back to a system font.")
+        for path in CAPTION_FONT_FALLBACKS:
+            if Path(path).exists():
+                return ImageFont.truetype(path, size)
+        return ImageFont.load_default()
 
 
 def is_highlighted(word: str) -> bool:
@@ -184,45 +176,102 @@ def is_highlighted(word: str) -> bool:
     return stripped not in CAPTION_STOPWORDS and len(stripped) > 0
 
 
-def render_caption_overlay(words: list, canvas_w: int, font, top_y: int, right_margin: int) -> Image.Image:
-    """Renders the revealed words as a single right-aligned line, uppercase, with
-    per-word yellow/white coloring and a bold black stroke outline (comic
-    speech-bubble style), on a semi-transparent rounded bar positioned on the right."""
+def build_caption_layout(narration: str, duration: float, font):
+    """Lays out the whole narration as a sequence of words with reveal times, wrapped
+    into lines of CAPTION_BOX_WIDTH and grouped into 'pages' of CAPTION_MAX_LINES --
+    once a page fills up, the next words start a fresh page (caption clears and
+    restarts), matching a typewriter effect that periodically resets.
+
+    Returns a list of pages, each: {"words": [{"word", "start", "line", "x"}], 
+    "page_start": float}.
+    """
+    words = narration.split()
     if not words:
-        return Image.new("RGBA", (canvas_w, top_y + 40), (0, 0, 0, 0))
+        return []
 
-    display_words = [w.upper() for w in words]
-    spacer = " "
-    full_text = spacer.join(display_words)
+    per_word = (duration / len(words)) * CAPTION_SPEED_FACTOR
 
-    measure_img = Image.new("RGBA", (canvas_w, 400), (0, 0, 0, 0))
+    measure_img = Image.new("RGBA", (10, 10), (0, 0, 0, 0))
     measure_draw = ImageDraw.Draw(measure_img)
-    bbox = measure_draw.textbbox((0, 0), full_text, font=font, stroke_width=6)
-    text_w = bbox[2] - bbox[0]
-    text_h = bbox[3] - bbox[1]
+    line_height = int(CAPTION_FONT_SIZE * 1.35)
+    space_w = measure_draw.textbbox((0, 0), "  ", font=font, stroke_width=5)[2]
 
-    pad_x, pad_y = 32, 18
-    overlay = Image.new("RGBA", (canvas_w, top_y + text_h + pad_y * 3), (0, 0, 0, 0))
+    pages = []
+    current_page_words = []
+    line_idx = 0
+    cursor_x = 0
+    t = 0.0
+
+    def start_new_page():
+        nonlocal current_page_words, line_idx, cursor_x
+        if current_page_words:
+            pages.append({"words": current_page_words, "page_start": current_page_words[0]["start"]})
+        current_page_words = []
+        line_idx = 0
+        cursor_x = 0
+
+    for w in words:
+        disp = w.upper()
+        word_w = measure_draw.textbbox((0, 0), disp, font=font, stroke_width=5)[2]
+        if cursor_x > 0 and cursor_x + word_w > CAPTION_BOX_WIDTH:
+            line_idx += 1
+            cursor_x = 0
+            if line_idx >= CAPTION_MAX_LINES:
+                start_new_page()
+
+        start_time = max(0.0, t - CAPTION_LEAD_TIME)
+        current_page_words.append({"word": w, "start": start_time, "line": line_idx, "x": cursor_x})
+        cursor_x += word_w + space_w
+        t += per_word
+
+    if current_page_words:
+        pages.append({"words": current_page_words, "page_start": current_page_words[0]["start"]})
+
+    return pages
+
+
+def active_page_words_at(pages, t: float):
+    active = None
+    for page in pages:
+        if page["page_start"] <= t:
+            active = page
+        else:
+            break
+    if active is None:
+        return None
+    return [w for w in active["words"] if w["start"] <= t]
+
+
+def render_caption_overlay(words: list, canvas_w: int, canvas_h: int, font) -> Image.Image:
+    """Renders the currently-revealed words at their pre-computed line/x positions,
+    right-anchored, with per-word yellow/white coloring and a soft stroke outline."""
+    overlay = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
+    if not words:
+        return overlay
     draw = ImageDraw.Draw(overlay)
 
-    # Right-aligned instead of centered
-    x = canvas_w - right_margin - text_w
-    bar_box = (x - pad_x, top_y - pad_y, x + text_w + pad_x, top_y + text_h + pad_y)
-    draw.rounded_rectangle(bar_box, radius=20, fill=(15, 15, 20, 190))
+    line_height = int(CAPTION_FONT_SIZE * 1.35)
+    box_left = canvas_w - CAPTION_RIGHT_MARGIN - CAPTION_BOX_WIDTH
+    max_line = max(w["line"] for w in words)
+    box_height = (max_line + 1) * line_height
 
-    cursor_x = x
-    for original_word, disp_word in zip(words, display_words):
-        color = (255, 214, 10, 255) if is_highlighted(original_word) else (255, 255, 255, 255)
-        draw.text((cursor_x, top_y), disp_word, font=font, fill=color,
-                   stroke_width=6, stroke_fill=(20, 20, 25, 255))
-        word_bbox = draw.textbbox((cursor_x, top_y), disp_word + " ", font=font, stroke_width=6)
-        cursor_x = word_bbox[2]
+    pad = 22
+    bar_box = (box_left - pad, CAPTION_TOP_Y - pad, box_left + CAPTION_BOX_WIDTH + pad,
+               CAPTION_TOP_Y + box_height + pad)
+    draw.rounded_rectangle(bar_box, radius=22, fill=(15, 15, 20, 185))
+
+    for w in words:
+        color = (255, 214, 10, 255) if is_highlighted(w["word"]) else (255, 255, 255, 255)
+        x = box_left + w["x"]
+        y = CAPTION_TOP_Y + w["line"] * line_height
+        draw.text((x, y), w["word"].upper(), font=font, fill=color,
+                   stroke_width=5, stroke_fill=(20, 20, 25, 255))
 
     return overlay
 
 
-def render_scene(char_img: Image.Image, caption_lines, side: str, duration: float,
-                  audio_path: Path, out_path: Path, char_scale=0.85, fps=FPS):
+def render_scene(char_img: Image.Image, pages, side: str, duration: float,
+                  audio_path: Path, out_path: Path, font, char_scale=0.85, fps=FPS):
     char_h = int(CANVAS_H * char_scale)
     char_w = int(char_h * char_img.width / char_img.height)
     margin = int(CANVAS_W * 0.05)
@@ -231,8 +280,6 @@ def render_scene(char_img: Image.Image, caption_lines, side: str, duration: floa
 
     resized_char = char_img.resize((char_w, char_h), Image.LANCZOS)
     total_frames = max(int(duration * fps), fps)
-
-    font = load_caption_font(52)
 
     ffmpeg_cmd = [
         "ffmpeg", "-y",
@@ -243,38 +290,25 @@ def render_scene(char_img: Image.Image, caption_lines, side: str, duration: floa
     ]
     proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE)
 
-    bg = Image.new("RGBA", (CANVAS_W, CANVAS_H), (*BACKGROUND_COLOR, 255))
-    sway_phase = random.uniform(0, math.pi * 2)
-    breathe_phase = random.uniform(0, math.pi * 2)
-    last_revealed_key = None
+    # Static base frame: solid background + character pasted once (no per-frame motion)
+    base_frame = Image.new("RGBA", (CANVAS_W, CANVAS_H), (*BACKGROUND_COLOR, 255))
+    base_frame.alpha_composite(resized_char, (anchor_x, anchor_y))
+
+    last_words_key = None
     caption_overlay = None
 
     for i in range(total_frames):
         t = i / fps
 
-        bob = int(5 * math.sin(2 * math.pi * t / 2.6))
-        sway = int(4 * math.sin(2 * math.pi * t / 3.4 + sway_phase))
-        rotation = 1.4 * math.sin(2 * math.pi * t / 4.1 + sway_phase)
-        breathe_scale = 1.0 + 0.012 * math.sin(2 * math.pi * t / 3.0 + breathe_phase)
+        revealed = active_page_words_at(pages, t)
+        revealed_key = tuple((w["word"], w["line"]) for w in revealed) if revealed else None
+        if revealed_key != last_words_key:
+            caption_overlay = render_caption_overlay(revealed or [], CANVAS_W, CANVAS_H, font)
+            last_words_key = revealed_key
 
-        transformed = resized_char.rotate(rotation, resample=Image.BICUBIC, expand=False)
-        if breathe_scale != 1.0:
-            new_w = int(transformed.width * breathe_scale)
-            new_h = int(transformed.height * breathe_scale)
-            transformed = transformed.resize((new_w, new_h), Image.LANCZOS)
-
-        paste_x = anchor_x + sway - (transformed.width - char_w) // 2
-        paste_y = anchor_y + bob - (transformed.height - char_h) // 2
-
-        frame = bg.copy()
-        frame.alpha_composite(transformed, (paste_x, paste_y))
-
-        revealed = revealed_text_at(caption_lines, t)
-        revealed_key = tuple(revealed) if revealed else None
-        if revealed_key != last_revealed_key:
-            caption_overlay = render_caption_overlay(revealed or [], CANVAS_W, font, CAPTION_TOP_Y, CAPTION_RIGHT_MARGIN)
-            last_revealed_key = revealed_key
-        if caption_overlay is not None and revealed:
+        frame = base_frame if not revealed else base_frame.copy()
+        if revealed and caption_overlay is not None:
+            frame = base_frame.copy()
             frame.alpha_composite(caption_overlay, (0, 0))
 
         proc.stdin.write(frame.convert("RGB").tobytes())
@@ -302,7 +336,7 @@ def add_background_music(video_path: Path, music_path: Path, out_path: Path, vol
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Generate a Mikasan-narrated cartoon with a fixed character, solid background, and karaoke captions.")
+    ap = argparse.ArgumentParser(description="Generate a Mikasan-narrated cartoon with a static character, solid background, and typewriter captions.")
     ap.add_argument("--script", required=True)
     ap.add_argument("--out", default="output/final_video.mp4")
     ap.add_argument("--voice-sample", default=None)
@@ -325,6 +359,7 @@ def main():
 
     print(f"Loaded {len(scenes)} scene(s). Voice sample: {voice_sample}. Music: {music or 'none'}")
     char_img = load_character()
+    font = load_caption_font(workdir)
     voice = ClonedVoice(Path(voice_sample), language=args.language)
 
     clip_paths = []
@@ -338,10 +373,10 @@ def main():
         voice.synth(scene["narration"], audio_wav)
         duration = get_duration(audio_wav) + 0.3
 
-        caption_lines = build_caption_lines(scene["narration"], duration)
+        pages = build_caption_layout(scene["narration"], duration, font)
 
         print(f"  -> rendering scene ({side} side, {duration:.1f}s, {int(duration*FPS)} frames)")
-        render_scene(char_img, caption_lines, side, duration, audio_wav, clip_path,
+        render_scene(char_img, pages, side, duration, audio_wav, clip_path, font,
                      char_scale=args.character_scale)
         clip_paths.append(clip_path)
 
