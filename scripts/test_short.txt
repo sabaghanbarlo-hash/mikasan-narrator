@@ -1,6 +1,5 @@
-VOICE_SAMPLE: voice_samples/Bee.m4a
+VOICE: en-US-AriaNeural
 MUSIC:
 
 ---
-IMAGE: cozy sunlit bedroom, anime background art, soft morning light through curtains
 Hey, it's me. Just testing if this whole thing actually works.
