@@ -1,8 +1,3 @@
 Pillow
 requests
-TTS
-# Coqui TTS's XTTS module needs older/compatible deps than latest PyPI defaults
-transformers==4.39.3
-tokenizers==0.15.2
-torch==2.5.1
-torchaudio==2.5.1
+edge-tts
