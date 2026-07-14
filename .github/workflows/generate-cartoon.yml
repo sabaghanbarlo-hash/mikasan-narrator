@@ -27,13 +27,9 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y ffmpeg fonts-dejavu
 
       - name: Install Python dependencies
-        env:
-          COQUI_TOS_AGREED: "1"
         run: pip install -r requirements.txt
 
       - name: Generate video
-        env:
-          COQUI_TOS_AGREED: "1"
         run: |
           mkdir -p output
           python generate_video.py --script "${{ github.event.inputs.script_path }}" --out "output/${{ github.event.inputs.output_name }}"
