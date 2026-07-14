@@ -2,33 +2,34 @@
 """
 Mikasan Narrator - long-form cartoon generator
 -----------------------------------------------
-Turns a plain-text script into a video narrated in Saba's own cloned voice, with the
-fixed Mikasan character (assets/character/character.png), a solid tan background, and
-typewriter-style accumulating captions synced to the narration -- all free, no API keys.
+Turns a plain-text script into a video narrated by a stable, natural free TTS voice
+(edge-tts), with the fixed Mikasan character (assets/character/character.png), a
+solid tan background, and typewriter-style accumulating captions -- all free, no API
+keys.
 
 HOW IT WORKS:
-  1. The character is a FIXED reference image (assets/character/character.png), held
-     static (no idle sway) and placed on alternating left/right sides per scene.
-  2. The background is a solid flat color (BACKGROUND_COLOR below), matching the
+  1. Narration is synthesized with edge-tts (Microsoft's free neural TTS) -- switched
+     from cloned-voice XTTS-v2, which was cracking/unstable on longer lines.
+  2. The character is a FIXED reference image (assets/character/character.png), held
+     static and placed on alternating left/right sides per scene.
+  3. The background is a solid flat color (BACKGROUND_COLOR below), matching the
      reference art style.
-  3. Captions build up word by word (typewriter/karaoke style) and ACCUMULATE across
-     multiple lines -- previous words stay on screen as new ones are added -- until
-     the caption block is full, at which point it clears and starts over. Rendered on
-     the right side, lower on the frame (comic speech-bubble style), in a soft rounded
-     font (Baloo 2) with content words highlighted in yellow.
+  4. Captions build up word by word (typewriter/karaoke style) and ACCUMULATE across
+     multiple lines until the caption block is full, then clear and restart.
+     Rendered on the right side, lower on the frame (comic speech-bubble style), in a
+     soft rounded font (Baloo 2) with content words highlighted in yellow.
 
 NOTE ON CHARACTER VARIETY: right now there's only one pose (character.png), so the
-character is fully static. The code below is structured so that if you add more pose
-images (e.g. assets/character/pose_gesture.png for a hand-raised pose), it's a small
-change to swap between them periodically -- ask Claude to wire that up once you have
-more art in the same style.
+character is fully static. If you add more pose images (e.g.
+assets/character/pose_gesture.png for a hand-raised pose), it's a small change to
+swap between them periodically.
 
 Usage:
     python generate_video.py --script scripts/example_script.txt --out output/final_video.mp4
 """
 
 import argparse
-import os
+import asyncio
 import shutil
 import subprocess
 import sys
@@ -39,7 +40,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 CANVAS_W, CANVAS_H = 1920, 1080
 FPS = 25
-DEFAULT_VOICE_SAMPLE = "voice_samples/Bee.m4a"
+DEFAULT_VOICE_NAME = "en-US-AriaNeural"  # stable, natural free neural voice (edge-tts)
 CHARACTER_PATH = Path(__file__).parent / "assets" / "character" / "character.png"
 
 # Sampled directly from Saba's reference art
@@ -75,15 +76,15 @@ def parse_script(path: str):
     raw = Path(path).read_text(encoding="utf-8")
     blocks = raw.split("---")
 
-    settings = {"voice_sample": DEFAULT_VOICE_SAMPLE, "music": None}
+    settings = {"voice_name": DEFAULT_VOICE_NAME, "music": None}
     header = blocks[0].strip()
     for line in header.splitlines():
         line = line.strip()
         if not line:
             continue
-        if line.upper().startswith("VOICE_SAMPLE:"):
+        if line.upper().startswith("VOICE:"):
             val = line.split(":", 1)[1].strip()
-            settings["voice_sample"] = val or DEFAULT_VOICE_SAMPLE
+            settings["voice_name"] = val or DEFAULT_VOICE_NAME
         elif line.upper().startswith("MUSIC:"):
             val = line.split(":", 1)[1].strip()
             settings["music"] = val or None
@@ -109,19 +110,21 @@ def parse_script(path: str):
     return settings, scenes
 
 
-class ClonedVoice:
-    def __init__(self, speaker_wav: Path, language: str = "en"):
-        os.environ.setdefault("COQUI_TOS_AGREED", "1")
-        from TTS.api import TTS
-        print("  Loading XTTS-v2 (first run downloads ~1.9GB model)...")
-        self.tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2")
-        self.speaker_wav = str(speaker_wav)
-        self.language = language
+class Narrator:
+    """Free, stable neural TTS via edge-tts (Microsoft). Not a cloned voice --
+    switched from XTTS-v2 cloning, which was cracking on longer narration lines."""
+
+    def __init__(self, voice_name: str = DEFAULT_VOICE_NAME):
+        self.voice_name = voice_name
 
     def synth(self, text: str, out_wav: Path):
-        self.tts.tts_to_file(
-            text=text, speaker_wav=self.speaker_wav, language=self.language, file_path=str(out_wav),
-        )
+        import edge_tts
+
+        async def _run():
+            communicate = edge_tts.Communicate(text, self.voice_name)
+            await communicate.save(str(out_wav))
+
+        asyncio.run(_run())
 
 
 def run(cmd, **kwargs):
@@ -177,14 +180,6 @@ def is_highlighted(word: str) -> bool:
 
 
 def build_caption_layout(narration: str, duration: float, font):
-    """Lays out the whole narration as a sequence of words with reveal times, wrapped
-    into lines of CAPTION_BOX_WIDTH and grouped into 'pages' of CAPTION_MAX_LINES --
-    once a page fills up, the next words start a fresh page (caption clears and
-    restarts), matching a typewriter effect that periodically resets.
-
-    Returns a list of pages, each: {"words": [{"word", "start", "line", "x"}], 
-    "page_start": float}.
-    """
     words = narration.split()
     if not words:
         return []
@@ -193,7 +188,6 @@ def build_caption_layout(narration: str, duration: float, font):
 
     measure_img = Image.new("RGBA", (10, 10), (0, 0, 0, 0))
     measure_draw = ImageDraw.Draw(measure_img)
-    line_height = int(CAPTION_FONT_SIZE * 1.35)
     space_w = measure_draw.textbbox((0, 0), "  ", font=font, stroke_width=5)[2]
 
     pages = []
@@ -243,8 +237,6 @@ def active_page_words_at(pages, t: float):
 
 
 def render_caption_overlay(words: list, canvas_w: int, canvas_h: int, font) -> Image.Image:
-    """Renders the currently-revealed words at their pre-computed line/x positions,
-    right-anchored, with per-word yellow/white coloring and a soft stroke outline."""
     overlay = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
     if not words:
         return overlay
@@ -290,7 +282,6 @@ def render_scene(char_img: Image.Image, pages, side: str, duration: float,
     ]
     proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE)
 
-    # Static base frame: solid background + character pasted once (no per-frame motion)
     base_frame = Image.new("RGBA", (CANVAS_W, CANVAS_H), (*BACKGROUND_COLOR, 255))
     base_frame.alpha_composite(resized_char, (anchor_x, anchor_y))
 
@@ -339,15 +330,14 @@ def main():
     ap = argparse.ArgumentParser(description="Generate a Mikasan-narrated cartoon with a static character, solid background, and typewriter captions.")
     ap.add_argument("--script", required=True)
     ap.add_argument("--out", default="output/final_video.mp4")
-    ap.add_argument("--voice-sample", default=None)
-    ap.add_argument("--language", default="en")
+    ap.add_argument("--voice-name", default=None, help="edge-tts voice name, e.g. en-US-AriaNeural")
     ap.add_argument("--music", default=None)
     ap.add_argument("--character-scale", type=float, default=0.85)
     ap.add_argument("--keep-temp", action="store_true")
     args = ap.parse_args()
 
     settings, scenes = parse_script(args.script)
-    voice_sample = args.voice_sample or settings["voice_sample"]
+    voice_name = args.voice_name or settings["voice_name"]
     music = args.music or settings["music"]
 
     out_path = Path(args.out)
@@ -357,10 +347,10 @@ def main():
         shutil.rmtree(workdir)
     workdir.mkdir(parents=True)
 
-    print(f"Loaded {len(scenes)} scene(s). Voice sample: {voice_sample}. Music: {music or 'none'}")
+    print(f"Loaded {len(scenes)} scene(s). Voice: {voice_name}. Music: {music or 'none'}")
     char_img = load_character()
     font = load_caption_font(workdir)
-    voice = ClonedVoice(Path(voice_sample), language=args.language)
+    narrator = Narrator(voice_name)
 
     clip_paths = []
     for i, scene in enumerate(scenes):
@@ -369,8 +359,8 @@ def main():
         clip_path = workdir / f"scene_{i:03}.mp4"
         side = "left" if i % 2 == 0 else "right"
 
-        print("  -> synthesizing narration (cloned voice, XTTS-v2)")
-        voice.synth(scene["narration"], audio_wav)
+        print("  -> synthesizing narration (edge-tts)")
+        narrator.synth(scene["narration"], audio_wav)
         duration = get_duration(audio_wav) + 0.3
 
         pages = build_caption_layout(scene["narration"], duration, font)
